@@ -1,6 +1,6 @@
 # app.py
-# RAMKAR MFS v2.7.2 - TAM GÜVENLİK
-# 2 Adımlı Kill + Kilitli Tarama + CSV Kara Kutu
+# RAMKAR MFS v2.7.3 - TREND ANALİZİ
+# Çizgi Grafik + Detaylı Metrikler + Haftalık Takip
 
 import math
 from dataclasses import dataclass
@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 try:
     import yfinance as yf
@@ -40,14 +41,25 @@ st.markdown("""
     }
     [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
     section[data-testid="stSidebar"] { width: 280px !important; }
+    
+    .metric-card {
+        background: linear-gradient(135deg, #1a1a2e, #16213e);
+        border-radius: 10px;
+        padding: 15px;
+        margin: 5px 0;
+    }
+    .trend-up { color: #00c853; }
+    .trend-down { color: #ff1744; }
+    .trend-neutral { color: #ffc107; }
 </style>
 """, unsafe_allow_html=True)
 
-APP_VERSION = "v2.7.2"
+APP_VERSION = "v2.7.3"
 LOG_FILE = "mfs_kara_kutu.csv"
+HISTORY_FILE = "mfs_haftalik_gecmis.csv"
 
 # ================================
-# KATILIM ENDEKSİ HİSSELERİ (217)
+# KATILIM HİSSELERİ (217)
 # ================================
 KATILIM_HISSELERI = [
     "ACSEL", "AHSGY", "AKFYE", "AKSA", "AKYHO", "ALBRK", "ALCTL", "ALKA", 
@@ -126,13 +138,81 @@ STATE_COLORS = {"ON": "#00c853", "NEUTRAL": "#ffc107", "OFF": "#ff1744", "OFF-KI
 
 
 # ================================
-# KARA KUTU (CSV LOG)
+# HAFTALIK GEÇMİŞ (TREND İÇİN)
+# ================================
+def save_weekly_data(data: Dict):
+    """Haftalık veriyi CSV'ye kaydet"""
+    file_exists = os.path.exists(HISTORY_FILE)
+    
+    with open(HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                'Tarih', 'Hafta', 'MFS_Skor', 'Rejim', 
+                'Doviz_Skor', 'CDS_Skor', 'Global_Skor', 'Faiz_Skor', 'Likidite_Skor',
+                'USDTRY', 'CDS', 'VIX', 'SP500_Chg', 'XU100_Chg', 'XBANK_Chg'
+            ])
+        
+        # Hafta numarası
+        week_num = datetime.now().isocalendar()[1]
+        
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d"),
+            f"{datetime.now().year}-W{week_num:02d}",
+            data['mfs_skor'],
+            data['rejim'],
+            data['doviz_skor'],
+            data['cds_skor'],
+            data['global_skor'],
+            data['faiz_skor'],
+            data['likidite_skor'],
+            data['usdtry'],
+            data['cds'],
+            data['vix'],
+            data['sp500_chg'],
+            data['xu100_chg'],
+            data['xbank_chg']
+        ])
+
+
+def get_weekly_history() -> pd.DataFrame:
+    """Haftalık geçmişi oku"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            df = pd.read_csv(HISTORY_FILE)
+            df['Tarih'] = pd.to_datetime(df['Tarih'])
+            return df.tail(52)  # Son 52 hafta (1 yıl)
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def get_previous_week_data() -> Optional[Dict]:
+    """Önceki hafta verisini al"""
+    df = get_weekly_history()
+    if len(df) >= 1:
+        last = df.iloc[-1]
+        return {
+            'mfs_skor': last['MFS_Skor'],
+            'rejim': last['Rejim'],
+            'doviz_skor': last['Doviz_Skor'],
+            'cds_skor': last['CDS_Skor'],
+            'global_skor': last['Global_Skor'],
+            'faiz_skor': last['Faiz_Skor'],
+            'likidite_skor': last['Likidite_Skor'],
+            'usdtry': last['USDTRY'],
+            'cds': last['CDS'],
+            'vix': last['VIX']
+        }
+    return None
+
+
+# ================================
+# KARA KUTU (EVENT LOG)
 # ================================
 def log_to_csv(event_type: str, details: str, mfs_score: int, regime: str):
     """Her önemli olayı CSV'ye kaydet"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Dosya yoksa başlık yaz
     file_exists = os.path.exists(LOG_FILE)
     
     with open(LOG_FILE, 'a', newline='', encoding='utf-8') as f:
@@ -143,7 +223,6 @@ def log_to_csv(event_type: str, details: str, mfs_score: int, regime: str):
 
 
 def get_log_history() -> pd.DataFrame:
-    """Log geçmişini oku"""
     if os.path.exists(LOG_FILE):
         try:
             return pd.read_csv(LOG_FILE)
@@ -284,7 +363,6 @@ def get_xu100_data():
 
 
 def ramkar_scan_single(symbol: str, xu100_close, xu100_ema50) -> Tuple[Optional[Dict], bool]:
-    """Tek hisse tara. Returns (result, success)"""
     try:
         stock = yf.Ticker(f"{symbol}.IS")
         data = stock.history(period="1y", interval="1wk")
@@ -363,12 +441,11 @@ def ramkar_scan_single(symbol: str, xu100_close, xu100_ema50) -> Tuple[Optional[
             'stop_onay': stop_onay
         }, True
         
-    except Exception as e:
+    except:
         return None, False
 
 
 def run_full_scan(progress_callback=None):
-    """Tüm hisseleri tara + hata sayacı"""
     if not YF_AVAILABLE:
         return [], None, None, 0, 0
     
@@ -508,13 +585,79 @@ def score_likidite(vol):
 
 
 # ================================
-# CHARTS
+# GRAFİKLER
 # ================================
+def create_trend_chart(history_df: pd.DataFrame):
+    """MFS Skor trend grafiği"""
+    if history_df.empty:
+        return None
+    
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+        row_heights=[0.7, 0.3],
+        subplot_titles=('MFS Skor Trendi', 'Faktör Skorları')
+    )
+    
+    # Ana skor çizgisi
+    fig.add_trace(
+        go.Scatter(
+            x=history_df['Tarih'],
+            y=history_df['MFS_Skor'],
+            mode='lines+markers',
+            name='MFS Skor',
+            line=dict(color='#00d4ff', width=3),
+            marker=dict(size=8),
+            fill='tozeroy',
+            fillcolor='rgba(0,212,255,0.1)'
+        ),
+        row=1, col=1
+    )
+    
+    # Rejim bölgeleri
+    fig.add_hline(y=60, line_dash="dash", line_color="#00c853", annotation_text="ON", row=1, col=1)
+    fig.add_hline(y=40, line_dash="dash", line_color="#ff1744", annotation_text="OFF", row=1, col=1)
+    
+    # Faktör skorları
+    colors = {'Doviz_Skor': '#00d4ff', 'CDS_Skor': '#00c853', 'Global_Skor': '#ffc107', 
+              'Faiz_Skor': '#ff6b6b', 'Likidite_Skor': '#a855f7'}
+    
+    for col, color in colors.items():
+        if col in history_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=history_df['Tarih'],
+                    y=history_df[col],
+                    mode='lines',
+                    name=col.replace('_Skor', ''),
+                    line=dict(color=color, width=1.5),
+                    opacity=0.7
+                ),
+                row=2, col=1
+            )
+    
+    fig.update_layout(
+        height=400,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(26,26,46,0.8)',
+        font=dict(color='#ccc'),
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=50, r=20, t=60, b=20)
+    )
+    
+    fig.update_xaxes(gridcolor='#333', showgrid=True)
+    fig.update_yaxes(gridcolor='#333', showgrid=True, range=[0, 100])
+    
+    return fig
+
+
 def create_gauge(score, regime):
     color = STATE_COLORS.get(regime, "#666")
     
     fig = go.Figure(go.Indicator(
-        mode="gauge+number",
+        mode="gauge+number+delta",
         value=score,
         number={'font': {'size': 32, 'color': color}},
         gauge={
@@ -530,9 +673,48 @@ def create_gauge(score, regime):
     ))
     
     fig.update_layout(
-        height=160, margin=dict(l=20, r=20, t=20, b=0),
+        height=180, margin=dict(l=20, r=20, t=30, b=0),
         paper_bgcolor='rgba(0,0,0,0)',
     )
+    return fig
+
+
+def create_factor_bars(scores: Dict, prev_scores: Optional[Dict] = None):
+    """Faktör skorları bar chart + değişim"""
+    factors = ['Döviz', 'CDS', 'Küresel', 'Faiz', 'Likidite']
+    keys = ['doviz', 'cds', 'global', 'faiz', 'likidite']
+    values = [scores[k] for k in keys]
+    
+    # Değişimler
+    if prev_scores:
+        prev_keys = ['doviz_skor', 'cds_skor', 'global_skor', 'faiz_skor', 'likidite_skor']
+        changes = [scores[k] - prev_scores.get(pk, scores[k]) for k, pk in zip(keys, prev_keys)]
+    else:
+        changes = [0] * 5
+    
+    colors = ['#00d4ff' if v >= 60 else '#ffc107' if v >= 40 else '#ff1744' for v in values]
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=factors,
+        y=values,
+        marker_color=colors,
+        text=[f"{v}<br>({c:+.0f})" if c != 0 else str(v) for v, c in zip(values, changes)],
+        textposition='inside',
+        textfont=dict(color='white', size=11)
+    ))
+    
+    fig.update_layout(
+        height=200,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        yaxis=dict(range=[0, 100], gridcolor='#333', tickfont=dict(color='#888')),
+        xaxis=dict(tickfont=dict(color='#ccc')),
+        margin=dict(l=40, r=20, t=20, b=40),
+        showlegend=False
+    )
+    
     return fig
 
 
@@ -555,8 +737,8 @@ def create_radar(scores_dict):
             angularaxis=dict(tickfont=dict(size=10, color='#ccc')),
             bgcolor='rgba(0,0,0,0)'
         ),
-        showlegend=False, height=180,
-        margin=dict(l=40, r=40, t=20, b=20),
+        showlegend=False, height=200,
+        margin=dict(l=50, r=50, t=20, b=20),
         paper_bgcolor='rgba(0,0,0,0)',
     )
     return fig
@@ -579,7 +761,8 @@ defaults = {
     "xu100_ema50": None,
     "last_scan": None,
     "scan_errors": 0,
-    "show_kill_panel": False
+    "show_kill_panel": False,
+    "confirm_clear_log": False
 }
 
 for k, v in defaults.items():
@@ -591,7 +774,7 @@ for k, v in defaults.items():
 # SIDEBAR
 # ================================
 with st.sidebar:
-    st.markdown("### ⚙️ MFS Ayarları")
+    st.markdown("### ⚙️ MFS Veri Girişi")
     
     st.markdown("##### 📅 Önceki Hafta")
     prev_regime = st.selectbox("Rejim", ["ON", "NEUTRAL", "OFF", "OFF-KILL"],
@@ -627,13 +810,6 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     volume_ratio = c1.number_input("Hacim", value=1.0, step=0.1, format="%.1f")
     faiz_score = c2.number_input("Faiz", value=60, step=5)
-    
-    st.markdown("---")
-    if st.button("💾 Kaydet + Log", use_container_width=True):
-        st.session_state.prev_usdtry = usdtry_price
-        st.session_state.prev_cds = cds_level
-        st.session_state.prev_vix = vix_last
-        st.toast("✅ Kaydedildi!")
 
 
 # ================================
@@ -648,8 +824,6 @@ k4_ok = not ((xbank_wchg <= TH["K4_XBANK_DROP"]) and (xu100_wchg > TH["K4_XU100_
 k5_ok = volume_ratio >= TH["K5_VOLUME_RATIO"]
 
 checks = {"K1": k1_ok, "K2": k2_ok, "K3": k3_ok, "K4": k4_ok, "K5": k5_ok}
-
-# Manuel kill SADECE onaylanmışsa aktif
 hard_kill = (not k1_ok) or (not k2_ok) or (not k3_ok) or (st.session_state.manual_kill and st.session_state.kill_confirmed)
 
 soft_reduction = 0.0
@@ -685,73 +859,77 @@ if soft_reduction > 0:
 else:
     adj_pos, adj_risk = base_pos, base_risk
 
+# Önceki hafta verisi
+prev_week = get_previous_week_data()
+
 
 # ================================
 # MAIN UI
 # ================================
 # Header
-c1, c2 = st.columns([4, 1])
+c1, c2, c3 = st.columns([3, 1, 1])
 with c1:
     st.markdown(f"## 🎯 MFS + RAMKAR {APP_VERSION}")
 with c2:
+    if st.button("💾 KAYDET", type="primary"):
+        # Haftalık veriyi kaydet
+        save_weekly_data({
+            'mfs_skor': total,
+            'rejim': regime,
+            'doviz_skor': scores['doviz'],
+            'cds_skor': scores['cds'],
+            'global_skor': scores['global'],
+            'faiz_skor': scores['faiz'],
+            'likidite_skor': scores['likidite'],
+            'usdtry': usdtry_price,
+            'cds': cds_level,
+            'vix': vix_last,
+            'sp500_chg': sp500_wchg_pct,
+            'xu100_chg': xu100_wchg_pct,
+            'xbank_chg': xbank_wchg_pct
+        })
+        
+        # Session güncelle
+        st.session_state.prev_usdtry = usdtry_price
+        st.session_state.prev_cds = cds_level
+        st.session_state.prev_vix = vix_last
+        
+        # Log
+        log_to_csv("HAFTALIK_KAYIT", f"Skor:{total} Rejim:{regime}", total, regime)
+        
+        st.toast("✅ Haftalık veri kaydedildi!")
+        st.rerun()
+
+with c3:
     if st.button("🚨 ACİL", type="secondary" if not st.session_state.manual_kill else "primary"):
         st.session_state.show_kill_panel = not st.session_state.show_kill_panel
 
-# ================================
-# 2 ADIMLI MANUEL KILL PANELİ
-# ================================
+# Manuel Kill Panel
 if st.session_state.show_kill_panel:
     st.markdown("""
     <div style="background: linear-gradient(135deg, #ff1744, #ad1457); 
                 padding: 15px; border-radius: 10px; margin: 10px 0;">
-        <h3 style="color: white; margin: 0;">🚨 MANUEL KILL-SWITCH PROTOKOLÜ</h3>
+        <h3 style="color: white; margin: 0;">🚨 MANUEL KILL-SWITCH</h3>
     </div>
     """, unsafe_allow_html=True)
     
     if not st.session_state.manual_kill:
-        # ADIM 1: Sebep yaz
-        st.markdown("### Adım 1: Sebebi Yaz")
-        kill_reason = st.text_area(
-            "Neden manuel kill aktifleştiriyorsun?",
-            placeholder="Örn: Cumartesi gecesi savaş haberi geldi, piyasa kapalı...",
-            key="kill_reason_input"
-        )
+        kill_reason = st.text_area("Sebep (zorunlu):", placeholder="Neden manuel kill?", key="kill_input")
+        confirm = st.checkbox("Bu kill protokole uygundur", key="kill_check")
         
-        # ADIM 2: Onay kutusu
-        st.markdown("### Adım 2: Protokol Onayı")
-        confirm_check = st.checkbox(
-            "Bu kill manuel protokole uygundur (Kategori A/B olay veya Duygu Kotası)",
-            key="kill_confirm_check"
-        )
-        
-        # Aktivasyon
-        if kill_reason and len(kill_reason) >= 10 and confirm_check:
-            if st.button("🔴 MANUEL KILL AKTİFLEŞTİR", type="primary", use_container_width=True):
+        if kill_reason and len(kill_reason) >= 10 and confirm:
+            if st.button("🔴 AKTİFLEŞTİR", type="primary", use_container_width=True):
                 st.session_state.manual_kill = True
                 st.session_state.kill_confirmed = True
                 st.session_state.kill_reason = kill_reason
-                
-                # CSV'ye logla
                 log_to_csv("MANUEL_KILL_AKTIF", kill_reason, total, regime)
-                
-                st.success("✅ Manuel Kill aktifleştirildi ve loglandı!")
                 st.rerun()
         else:
-            st.warning("⚠️ Aktivasyon için: Sebep yaz (min 10 karakter) + Onay kutusunu işaretle")
-    
+            st.warning("⚠️ Sebep yaz (min 10 kar.) + Onay işaretle")
     else:
-        # Kill aktif - kaldırma seçeneği
-        st.error(f"""
-        🔴 **MANUEL KILL AKTİF**
-        
-        **Sebep:** {st.session_state.kill_reason}
-        **Tarih:** {datetime.now().strftime('%Y-%m-%d %H:%M')}
-        """)
-        
-        if st.button("🟢 Manuel Kill'i Kaldır", use_container_width=True):
-            # Kaldırma logla
-            log_to_csv("MANUEL_KILL_KALDIRILDI", f"Önceki sebep: {st.session_state.kill_reason}", total, regime)
-            
+        st.error(f"🔴 **AKTİF** | Sebep: {st.session_state.kill_reason}")
+        if st.button("🟢 KALDIR", use_container_width=True):
+            log_to_csv("MANUEL_KILL_KALDIRILDI", st.session_state.kill_reason, total, regime)
             st.session_state.manual_kill = False
             st.session_state.kill_confirmed = False
             st.session_state.kill_reason = ""
@@ -762,11 +940,17 @@ if st.session_state.show_kill_panel:
 # Uyarılar
 if validation.errors:
     st.error(f"⛔ {' | '.join(validation.errors)}")
-if st.session_state.manual_kill and st.session_state.kill_confirmed:
-    st.error(f"🚨 MANUEL KILL AKTİF: {st.session_state.kill_reason[:50]}...")
+if st.session_state.manual_kill:
+    st.error("🚨 MANUEL KILL AKTİF")
 
-# Ana Metrikler
+# Ana Metrikler - 4 Kutu
 c1, c2, c3, c4 = st.columns(4)
+
+# Önceki hafta ile karşılaştırma
+prev_score = prev_week['mfs_skor'] if prev_week else total
+score_change = total - prev_score
+trend_icon = "↑" if score_change > 0 else "↓" if score_change < 0 else "→"
+trend_color = "trend-up" if score_change > 0 else "trend-down" if score_change < 0 else "trend-neutral"
 
 color = STATE_COLORS[regime]
 c1.markdown(f"""<div style="background:{color}22;border:2px solid {color};border-radius:8px;padding:10px;text-align:center;">
@@ -777,7 +961,7 @@ c1.markdown(f"""<div style="background:{color}22;border:2px solid {color};border
 sc = "#00c853" if total >= 60 else "#ffc107" if total >= 40 else "#ff1744"
 c2.markdown(f"""<div style="background:#1a1a2e;border:2px solid {sc};border-radius:8px;padding:10px;text-align:center;">
 <div style="color:#888;font-size:0.8rem;">SKOR</div>
-<div style="color:{sc};font-size:1.5rem;font-weight:bold;">{total}</div>
+<div style="color:{sc};font-size:1.5rem;font-weight:bold;">{total} <span class="{trend_color}">{trend_icon}{abs(score_change)}</span></div>
 </div>""", unsafe_allow_html=True)
 
 c3.markdown(f"""<div style="background:#1a1a2e;border:2px solid #00d4ff;border-radius:8px;padding:10px;text-align:center;">
@@ -796,58 +980,114 @@ if transition_note:
 st.markdown("---")
 
 # Tabs
-tab1, tab2, tab3 = st.tabs(["📊 MFS", "🔥 RAMKAR", "📋 LOG"])
+tab1, tab2, tab3 = st.tabs(["📊 MFS ANALİZ", "🔥 RAMKAR", "📋 LOG"])
 
 with tab1:
-    c1, c2 = st.columns(2)
+    # Üst kısım: Gauge + Faktör Bar
+    c1, c2 = st.columns([1, 1.5])
     
     with c1:
         st.plotly_chart(create_gauge(total, regime), use_container_width=True)
+        
+        # Kill-switch durumu
         ks = " ".join([f"{'✅' if v else '❌'}{k}" for k, v in checks.items()])
         st.markdown(f"**Kill-Switch:** {ks}")
     
     with c2:
-        st.plotly_chart(create_radar(scores), use_container_width=True)
+        st.markdown("**Faktör Skorları**")
+        st.plotly_chart(create_factor_bars(scores, prev_week), use_container_width=True)
     
-    if regime == "ON":
-        st.success(f"🟢 **YEŞİL** | Max {adj_pos} poz, {adj_risk}R")
-    elif regime == "NEUTRAL":
-        st.warning(f"🟡 **DİKKAT** | Max {adj_pos} poz | Sadece A kalite")
-    elif regime == "OFF":
-        st.error(f"🔴 **RİSKLİ** | Max {adj_pos} poz | Çok sınırlı")
+    # Detaylı Faktör Tablosu
+    st.markdown("### 📈 Detaylı Analiz")
+    
+    factor_data = []
+    factor_names = ['💵 Döviz', '📊 CDS', '🌍 Küresel', '🏛️ Faiz', '💧 Likidite']
+    factor_keys = ['doviz', 'cds', 'global', 'faiz', 'likidite']
+    weights = [30, 25, 25, 15, 5]
+    
+    for name, key, weight in zip(factor_names, factor_keys, weights):
+        skor = scores[key]
+        katki = skor * weight / 100
+        
+        # Önceki hafta değişimi
+        if prev_week:
+            prev_key = f"{key}_skor"
+            prev_val = prev_week.get(prev_key, skor)
+            degisim = skor - prev_val
+            trend = "↑" if degisim > 0 else "↓" if degisim < 0 else "→"
+        else:
+            degisim = 0
+            trend = "→"
+        
+        factor_data.append({
+            'Faktör': name,
+            'Skor': skor,
+            'Ağırlık': f"%{weight}",
+            'Katkı': round(katki, 1),
+            'Δ': f"{trend}{abs(degisim):.0f}" if degisim != 0 else "→"
+        })
+    
+    df_factors = pd.DataFrame(factor_data)
+    st.dataframe(df_factors, hide_index=True, use_container_width=True)
+    
+    # Trend Grafiği
+    st.markdown("### 📉 Skor Trendi")
+    history = get_weekly_history()
+    
+    if not history.empty and len(history) >= 2:
+        fig = create_trend_chart(history)
+        if fig:
+            st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error(f"💀 **KİLİTLİ** | İşlem YASAK!")
+        st.info("📊 Trend görmek için en az 2 haftalık veri gerekli. Her hafta 'KAYDET' butonuna bas.")
+    
+    # Karar kutusu
+    st.markdown("### 🎯 Haftalık Karar")
+    if regime == "ON":
+        st.success(f"""
+        🟢 **YEŞİL IŞIK**
+        - Max **{adj_pos}** pozisyon açabilirsin
+        - Max **{adj_risk}R** toplam risk
+        - RAMKAR sinyallerini değerlendir
+        """)
+    elif regime == "NEUTRAL":
+        st.warning(f"""
+        🟡 **DİKKATLİ OL**
+        - Max **{adj_pos}** pozisyon
+        - Sadece **A kalite** sinyaller
+        - Risk azalt, seçici ol
+        """)
+    elif regime == "OFF":
+        st.error(f"""
+        🔴 **RİSK YÜKSEK**
+        - Max **{adj_pos}** pozisyon
+        - **Çok sınırlı** işlem
+        - Mevcut pozisyonları koru
+        """)
+    else:
+        st.error(f"""
+        💀 **SİSTEM KİLİTLİ**
+        - **YENİ İŞLEM YAPMA**
+        - Piyasa sakinleşene kadar bekle
+        """)
 
 with tab2:
     st.markdown("### 🔥 RAMKAR v30.4 Tarama")
     
-    # ================================
-    # OFF-KILL İKEN TARAMA KİLİTLİ
-    # ================================
     if regime == "OFF-KILL":
         st.error("""
         ### 🔒 TARAMA KİLİTLİ
-        
-        MFS rejimi **OFF-KILL** durumunda.
-        
-        Tarama yapılamaz çünkü:
-        - Tüm sinyaller geçersizdir
-        - Fırsat görmenin anlamı yok
-        - Önce MFS'i normale döndür
-        
-        **Yapman gereken:** Piyasa sakinleşene kadar bekle, manuel kill'i kaldır.
+        MFS rejimi **OFF-KILL** durumunda. Tarama yapılamaz.
         """)
     
     elif not YF_AVAILABLE:
-        st.error("yfinance yüklü değil: `pip install yfinance`")
+        st.error("yfinance yüklü değil")
     
     else:
-        # OFF modunda uyarı
         if regime == "OFF":
-            st.warning("⚠️ MFS OFF - Tarama sadece bilgi amaçlı. Yeni giriş riskli!")
+            st.warning("⚠️ MFS OFF - Tarama bilgi amaçlı")
         
         c1, c2, c3 = st.columns([2, 1, 1])
-        
         with c1:
             scan_btn = st.button("🔄 TARA", type="primary", use_container_width=True)
         with c2:
@@ -872,41 +1112,35 @@ with tab2:
             st.session_state.last_scan = datetime.now()
             st.session_state.scan_errors = errors
             
-            # Taramayı logla
             radar_count = len([r for r in results if r['status'] == 'RADAR'])
-            log_to_csv("TARAMA", f"Başarılı:{success} Hata:{errors} RADAR:{radar_count}", total, regime)
+            log_to_csv("TARAMA", f"OK:{success} Hata:{errors} RADAR:{radar_count}", total, regime)
             
             progress.empty()
             status.empty()
             st.rerun()
         
-        # Sonuçlar
         if st.session_state.scan_results:
             results = st.session_state.scan_results
             
-            # Hata uyarısı
             if st.session_state.scan_errors > 0:
-                st.warning(f"⚠️ {st.session_state.scan_errors} hisse veri çekilemedi (Yahoo Finance)")
+                st.warning(f"⚠️ {st.session_state.scan_errors} hisse veri çekilemedi")
             
             xu100_ok = st.session_state.xu100_close and st.session_state.xu100_ema50 and \
                        st.session_state.xu100_close > st.session_state.xu100_ema50
-            xu100_status = "✅" if xu100_ok else "❌"
             
             radar = [r for r in results if r['status'] == 'RADAR']
             izleme = [r for r in results if r['status'] == 'İZLEME']
             
-            st.markdown(f"**XU100:** {xu100_status} | **🚀 RADAR:** {len(radar)} | **⚡ İZLEME:** {len(izleme)}")
+            st.markdown(f"**XU100:** {'✅' if xu100_ok else '❌'} | **🚀 RADAR:** {len(radar)} | **⚡ İZLEME:** {len(izleme)}")
             
             st.markdown("---")
             st.markdown("### 🏆 Top 10")
             
-            # OFF modunda grileştir ama göster
             blocked = regime == "OFF"
             
             for i, r in enumerate(results[:10]):
                 opacity = "0.6" if blocked else "1"
                 
-                # Gemini'nin önerdiği şık kart tasarımı
                 st.markdown(f"""
                 <div style="background: #1a1a2e; border-left: 5px solid {r['status_color']}; 
                             padding: 12px; border-radius: 5px; margin-bottom: 8px; opacity: {opacity};">
@@ -930,64 +1164,50 @@ with tab2:
             with st.expander("📋 Tüm Sonuçlar"):
                 df = pd.DataFrame(results)
                 cols = ['symbol', 'price', 'score', 'status', 'adx', 'mfi', 'ema_dist', 'atr_pct']
-                df_show = df[cols].copy()
-                df_show.columns = ['Hisse', 'Fiyat', 'Skor', 'Durum', 'ADX', 'MFI', 'Mesafe%', 'ATR%']
-                st.dataframe(df_show, hide_index=True, use_container_width=True)
-        
+                st.dataframe(df[cols], hide_index=True, use_container_width=True)
         else:
             st.info("👆 TARA butonuna bas")
 
 with tab3:
-    st.markdown("### 📋 Kara Kutu (Event Log)")
+    st.markdown("### 📋 Kara Kutu")
     
     log_df = get_log_history()
     
     if not log_df.empty:
-        # Son kayıtları en üstte göster
         st.dataframe(log_df.iloc[::-1], hide_index=True, use_container_width=True)
         
         c1, c2 = st.columns(2)
         with c1:
-            # İndirme butonu
-            csv_data = log_df.to_csv(index=False)
-            st.download_button(
-                "📥 CSV İndir",
-                csv_data,
-                "mfs_kara_kutu.csv",
-                "text/csv",
-                use_container_width=True
-            )
+            st.download_button("📥 İndir", log_df.to_csv(index=False), "mfs_log.csv", use_container_width=True)
         with c2:
-            # Temizleme butonu (onaylı)
-            if st.button("🗑️ Logları Temizle", use_container_width=True):
+            if st.button("🗑️ Temizle", use_container_width=True):
                 st.session_state.confirm_clear_log = True
         
-        if st.session_state.get('confirm_clear_log', False):
-            st.warning("⚠️ Tüm log kayıtları silinecek. Emin misin?")
+        if st.session_state.get('confirm_clear_log'):
+            st.warning("⚠️ Emin misin?")
             c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✅ Evet, Sil", use_container_width=True):
-                    if os.path.exists(LOG_FILE):
-                        os.remove(LOG_FILE)
-                    st.session_state.confirm_clear_log = False
-                    st.rerun()
-            with c2:
-                if st.button("❌ İptal", use_container_width=True):
-                    st.session_state.confirm_clear_log = False
-                    st.rerun()
+            if c1.button("✅ Evet"):
+                if os.path.exists(LOG_FILE):
+                    os.remove(LOG_FILE)
+                st.session_state.confirm_clear_log = False
+                st.rerun()
+            if c2.button("❌ İptal"):
+                st.session_state.confirm_clear_log = False
+                st.rerun()
     else:
-        st.info("Henüz log kaydı yok. İşlemler kaydedilecek.")
+        st.info("Henüz log yok")
     
+    # Haftalık geçmiş
     st.markdown("---")
-    st.markdown("""
-    **Kaydedilen Olaylar:**
-    - 🔴 Manuel Kill aktivasyon/kaldırma
-    - 🔄 Tarama sonuçları
-    - 💾 Haftalık veri güncellemeleri
+    st.markdown("### 📈 Haftalık Geçmiş")
     
-    **Not:** Bu kayıtlar 6 ay sonra backtest için kullanılabilir.
-    """)
+    history = get_weekly_history()
+    if not history.empty:
+        st.dataframe(history.iloc[::-1], hide_index=True, use_container_width=True)
+        st.download_button("📥 Geçmiş İndir", history.to_csv(index=False), "mfs_gecmis.csv", use_container_width=True)
+    else:
+        st.info("Henüz haftalık kayıt yok. 'KAYDET' butonuna bas.")
 
 # Footer
 st.markdown("---")
-st.caption(f"MFS + RAMKAR {APP_VERSION} • {datetime.now().strftime('%d/%m/%Y %H:%M')} • Kara Kutu Aktif")
+st.caption(f"MFS + RAMKAR {APP_VERSION} • {datetime.now().strftime('%d/%m/%Y %H:%M')}")
